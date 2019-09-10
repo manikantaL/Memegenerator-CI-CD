@@ -1,0 +1,26 @@
+version: 0.2   
+phases:   
+  install:   
+    runtime-versions:   
+        nodejs: 10   
+           
+  build:   
+    commands:   
+      - pip install --user aws-sam-cli 
+      - USER_BASE_PATH=$(python -m site --user-base)     
+      - export PATH=$PATH:$USER_BASE_PATH/bin     
+      - export BUCKET=meme1234  
+      - npm install time   
+      - sam validate --template sam-template.yaml
+      - sam validate --template sam-production.yaml
+      - aws cloudformation package --template-file sam-template.yaml --s3-bucket $BUCKET --output-template-file outputtemplate-staging.yaml 
+      - aws cloudformation package --template-file sam-production.yaml --s3-bucket $BUCKET --output-template-file outputtemplate-production.yaml   
+         
+
+artifacts:   
+  type: zip    
+  files: 
+    - sam-template.yaml
+    - sam-production.yaml
+    - outputtemplate-staging.yaml 
+    - outputtemplate-production.yaml 

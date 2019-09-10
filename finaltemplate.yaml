@@ -1,0 +1,413 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Serverless CICD Quick Start resources
+Parameters:
+  EmailAddress:
+    Description: Email Address for sending SNS notifications for CodeCommit
+    Type: String
+  RepositoryBranch:
+    Description: The name of the branch for the CodeCommit repo
+    Type: String
+    Default: master
+    AllowedPattern: '[\x20-\x7E]*'
+    ConstraintDescription: Can contain only ASCII characters.
+Resources:
+  DeploymentRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub CodePipelineDeploymentRole
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - cloudformation.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AdministratorAccess'
+  PipelineServiceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-PipelineServiceRole'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+                - codebuild.amazonaws.com
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Resource: '*'
+                Effect: Allow
+                Action:
+                  - 'codecommit:*'
+              - Effect: Allow
+                Action:
+                  - 'sts:AssumeRole'
+                Resource:
+                  - !Sub >-
+                    arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-PipelineServiceRole
+              - Resource: '*'
+                Effect: Allow
+                Action:
+                  - 'cloudformation:*'
+      Path: /
+      ManagedPolicyArns:
+        - !Ref PipelineServiceRolePolicy
+  PipelineServiceRolePolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      Description: >-
+        This policy grants permissions to a service role to enable Codepipeline
+        to use multiple AWS Resources on the users behalf
+      Path: /
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Resource: '*'
+            Effect: Allow
+            Condition: {}
+            Action:
+              - 'cloudwatch:*'
+              - 'cloudtrail:*'
+              - 'cloudformation:*'
+              - 'codebuild:*'
+              - 'codecommit:*'
+              - 'codedeploy:*'
+              - 'codepipeline:*'
+              - 'ec2:*'
+              - 'iam:*'
+              - 'lambda:*'
+              - 'logs:*'
+              - 's3:*'
+              - 'sns:*'
+              - 'ssm:*'
+              - 'sqs:*'
+              - 'kms:*'
+              - 'apigateway:*'
+  ArtifactBucketKey:
+    Type: 'AWS::KMS::Key'
+    Properties:
+      Description: Code & Deployment Artifact Key
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: 2012-10-17
+        Id: !Ref 'AWS::StackName'
+        Statement:
+          - Sid: Allows admin of the key
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action:
+              - 'kms:Create*'
+              - 'kms:Describe*'
+              - 'kms:Enable*'
+              - 'kms:List*'
+              - 'kms:Put*'
+              - 'kms:Update*'
+              - 'kms:Revoke*'
+              - 'kms:Disable*'
+              - 'kms:Get*'
+              - 'kms:Delete*'
+              - 'kms:ScheduleKeyDeletion'
+              - 'kms:CancelKeyDeletion'
+            Resource: '*'
+          - Sid: Allow use of the key for CodePipeline
+            Effect: Allow
+            Principal:
+              AWS:
+                - !GetAtt 
+                  - PipelineServiceRole
+                  - Arn
+            Action:
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:DescribeKey'
+            Resource: '*'
+          - Sid: >-
+              Allow access through Amazon S3 for all principals in the accounts
+              that are authorized to use Amazon S3
+            Effect: Allow
+            Principal:
+              AWS: '*'
+            Action:
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:DescribeKey'
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'kms:ViaService': !Sub 's3.${AWS::Region}.amazonaws.com'
+                'kms:CallerAccount':
+                  - !Ref 'AWS::AccountId'
+  ArtifactBucketAlias:
+    Type: 'AWS::KMS::Alias'
+    Properties:
+      AliasName: alias/artifact-bucket
+      TargetKeyId: !Ref ArtifactBucketKey
+  ArtifactBucket:
+    DependsOn: ArtifactBucketKey
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              KMSMasterKeyID: !Sub '${ArtifactBucketKey.Arn}'
+              SSEAlgorithm: 'aws:kms'
+  MySNSTopic:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      Subscription:
+        - Endpoint: !Ref EmailAddress
+          Protocol: email
+  CodeCommitRepo:
+    Type: 'AWS::CodeCommit::Repository'
+    Properties:
+      RepositoryName: !Ref 'AWS::StackName'
+      RepositoryDescription: CodeCommit Repository
+      Triggers:
+        - Name: MasterTrigger
+          CustomData: !Ref 'AWS::StackName'
+          DestinationArn: !Ref MySNSTopic
+          Events:
+            - all
+  Pipeline:
+    Type: 'AWS::CodePipeline::Pipeline'
+    DependsOn: BuildProject
+    Properties:
+      RoleArn: !GetAtt 
+        - PipelineServiceRole
+        - Arn
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: CodeCommitSourceAction
+              RunOrder: 1
+              ActionTypeId:
+                Category: Source
+                Provider: CodeCommit
+                Owner: AWS
+                Version: '1'
+              OutputArtifacts:
+                - Name: Source
+              Configuration:
+                RepositoryName: !Ref 'AWS::StackName'
+                BranchName: !Ref RepositoryBranch
+        - Name: Build
+          Actions:
+            - Name: Build
+              RunOrder: 1
+              InputArtifacts:
+                - Name: Source
+              ActionTypeId:
+                Category: Build
+                Provider: CodeBuild
+                Owner: AWS
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref BuildProject
+              OutputArtifacts:
+                - Name: BuildArtifact
+        - Name: DeployToDev
+          Actions:
+            - Name: CreateChangeSet
+              RunOrder: 1
+              InputArtifacts:
+                - Name: BuildArtifact
+              ActionTypeId:
+                Category: Deploy
+                Provider: CloudFormation
+                Owner: AWS
+                Version: '1'
+              Configuration:
+                ActionMode: CHANGE_SET_REPLACE
+                Capabilities: 'CAPABILITY_IAM'
+                ChangeSetName: !Sub '${AWS::StackName}-changeset'
+                StackName: !Sub '${AWS::StackName}-Staging'
+                RoleArn: !GetAtt 
+                  - DeploymentRole
+                  - Arn
+                TemplatePath: 'BuildArtifact::outputtemplate-staging.yaml'
+              RoleArn: !GetAtt 
+                - PipelineServiceRole
+                - Arn
+            - Name: DeployChangeSet
+              RunOrder: 2
+              InputArtifacts:
+                - Name: BuildArtifact
+              ActionTypeId:
+                Category: Deploy
+                Provider: CloudFormation
+                Owner: AWS
+                Version: '1'
+              Configuration:
+                ActionMode: CHANGE_SET_EXECUTE
+                Capabilities: 'CAPABILITY_IAM'
+                ChangeSetName: !Sub '${AWS::StackName}-changeset'
+                RoleArn: !GetAtt 
+                  - DeploymentRole
+                  - Arn
+                StackName: !Sub '${AWS::StackName}-Staging'
+              RoleArn: !GetAtt 
+                - PipelineServiceRole
+                - Arn
+        - Name: DeployToProd
+          Actions:
+            - Name: Approval
+              RunOrder: 1
+              ActionTypeId:
+                Category: Approval
+                Provider: Manual
+                Owner: AWS
+                Version: '1'
+              Configuration:
+                NotificationArn: !Ref MySNSTopic
+            - Name: CreateChangeSet
+              RunOrder: 2
+              InputArtifacts:
+                - Name: BuildArtifact
+              ActionTypeId:
+                Category: Deploy
+                Provider: CloudFormation
+                Owner: AWS
+                Version: '1'
+              Configuration:
+                ActionMode: CHANGE_SET_REPLACE
+                Capabilities: 'CAPABILITY_IAM'
+                ChangeSetName: !Sub '${AWS::StackName}-changeset'
+                StackName: !Sub '${AWS::StackName}-Prod'
+                RoleArn: !GetAtt 
+                  - DeploymentRole
+                  - Arn
+                TemplatePath: 'BuildArtifact::outputtemplate-production.yaml'
+              RoleArn: !GetAtt 
+                - PipelineServiceRole
+                - Arn
+            - Name: DeployChangeSet
+              RunOrder: 3
+              InputArtifacts:
+                - Name: BuildArtifact
+              ActionTypeId:
+                Category: Deploy
+                Provider: CloudFormation
+                Owner: AWS
+                Version: '1'
+              Configuration:
+                ActionMode: CHANGE_SET_EXECUTE
+                Capabilities: 'CAPABILITY_IAM'
+                ChangeSetName: !Sub '${AWS::StackName}-changeset'
+                RoleArn: !GetAtt 
+                  - DeploymentRole
+                  - Arn
+                StackName: !Sub '${AWS::StackName}-Prod'
+              RoleArn: !GetAtt 
+                - PipelineServiceRole
+                - Arn  
+             
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+        EncryptionKey:
+          Id: !GetAtt 
+            - ArtifactBucketKey
+            - Arn
+          Type: KMS
+  BuildProject:
+    Type: 'AWS::CodeBuild::Project'
+    DependsOn: PipelineServiceRole
+    Properties:
+      Artifacts:
+        Type: no_artifacts
+      Source:
+        Location: !Join 
+          - ''
+          - - 'https://git-codecommit.'
+            - !Ref 'AWS::Region'
+            - .amazonaws.com/v1/repos/
+            - !Ref 'AWS::StackName'
+        Type: CODECOMMIT
+      TimeoutInMinutes: 10
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Type: LINUX_CONTAINER
+        Image: 'aws/codebuild/amazonlinux2-x86_64-standard:1.0'
+      ServiceRole: !GetAtt 
+        - PipelineServiceRole
+        - Arn
+      EncryptionKey: !GetAtt 
+        - ArtifactBucketKey
+        - Arn
+Outputs:
+  PipelineArtifactBucket:
+    Description: Artifact bucket for all pipelines
+    Value: !Ref ArtifactBucket
+  PipelineServiceRoleArn:
+    Description: ARN of the IAM role used by CodePipeline and CodeBuild
+    Value: !GetAtt 
+      - PipelineServiceRole
+      - Arn
+  ArtifactBucketKeyArn:
+    Description: KMS key for codepipelines and artifacts
+    Value: !GetAtt 
+      - ArtifactBucketKey
+      - Arn
+  ArtifactBucketKeyId:
+    Description: KMS key ID for codepipelines and artifacts
+    Value: !Ref ArtifactBucketKey
+  ArtifactBucketAliasName:
+    Description: KMS key alias for codepipelines and artifacts
+    Value: !Ref ArtifactBucketAlias
+  CodeBuildURL:
+    Value: !Join 
+      - ''
+      - - 'https://console.aws.amazon.com/codebuild/home?region='
+        - !Ref 'AWS::Region'
+        - '#/projects/'
+        - !Ref BuildProject
+        - /view
+    Description: CodeBuild URL
+  CodeCommitURL:
+    Value: !Join 
+      - ''
+      - - 'https://console.aws.amazon.com/codecommit/home?region='
+        - !Ref 'AWS::Region'
+        - '#/repository/'
+        - !Ref 'AWS::StackName'
+        - /browse/HEAD/--/
+    Description: Git Repository URL
+  CodeDeployURL:
+    Value: !Join 
+      - ''
+      - - 'https://console.aws.amazon.com/codedeploy/home?region='
+        - !Ref 'AWS::Region'
+        - '#/deployments/'
+    Description: CodeDeploy URL
+  CloneUrlSsh:
+    Value: !Join 
+      - ''
+      - - 'git clone '
+        - !GetAtt 
+          - CodeCommitRepo
+          - CloneUrlSsh
+        - ''
+    Description: Git command for CodeCommit repository
+  CodePipelineURL:
+    Value: !Join 
+      - ''
+      - - 'https://console.aws.amazon.com/codepipeline/home?region='
+        - !Ref 'AWS::Region'
+        - '#/view/'
+        - !Ref Pipeline
+    Description: CodePipeline URL
